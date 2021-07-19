@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Javabulder Continuous Integration pipeline
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: Name of existing S3 bucket for storing pipeline artifacts
+  TemplateBucket:
+    Type: String
+    Description: Name of existing S3 bucket for storing CloudFormation template artifacts
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+  GitHubRepo:
+    Type: String
+    Default: javabuilder
+    Description: GitHub repository name
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub repository branch
+  GitHubToken:
+    Type: String
+    Description: GitHub repository OAuth token
+    NoEcho: true
+  CodePipelineServiceRoleName:
+    Type: String
+    Description: CodePipeline Service Role name
+    Default: AWS-CodePipeline-Service
+  SubDomainName:
+    Type: String
+    Description: Subdomain name of production service. Also used as the CloudFormation Stack name for the production service.
+    Default: javabuilder
+  StagingSubDomainName:
+    Type: String
+    Description: Subdomain name of staging service. Also used as the CloudFormation Stack name for the staging service.
+    Default: javabuilder-staging
+  BaseDomainName:
+    Type: String
+    Description: Base domain name.
+    Default: dev-code.org
+  BaseDomainNameHostedZonedID:
+    Type: String
+    Description: AWS Route53 Hosted Zone ID for base domain name.
+    Default: Z07248463JGJ44FME5BZ5
+  SlackApprovalChannel:
+    Type: String
+    Description: Slack channel for manual approval actions
+  SlackSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: Slack signing secret for manual approval actions
+  SlackToken:
+    Type: String
+    NoEcho: true
+    Description: Slack app Oauth token
+  SlackPipelineChannel:
+    Type: String
+    Description: Slack channel ID for pipeline event notifications
+
+Globals:
+  Function:
+    Runtime: nodejs14.x
+    Timeout: 10
+    MemorySize: 3008
+
+Resources:
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref SubDomainName
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/${CodePipelineServiceRoleName}"
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts: [Name: Repo]
+        - Name: Build
+          Actions:
+            - Name: Build
+              RunOrder: 1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              InputArtifacts: [Name: Repo]
+              Configuration:
+                ProjectName: !Ref Build
+              OutputArtifacts: [Name: Package]
+        - Name: Staging
+          Actions:
+            - Name: Prepare
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts: [Name: Package]
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: StagingChangeSet
+                RoleArn: !ImportValue JavabuilderCloudFormationRole
+                StackName: !Ref StagingSubDomainName
+                TemplatePath: Package::output.yml
+                TemplateConfiguration: Package::configuration-staging.json
+              OutputArtifacts: [Name: StagingChangeSet]
+            - Name: Deploy
+              RunOrder: 2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts: [Name: StagingChangeSet]
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: StagingChangeSet
+                StackName: !Ref StagingSubDomainName
+        - Name: Production
+          Actions:
+            - Name: Prepare
+              RunOrder: 1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts: [Name: Package]
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: ProdChangeSet
+                RoleArn: !ImportValue JavabuilderCloudFormationRole
+                StackName: !Ref SubDomainName
+                TemplatePath: Package::output.yml
+                TemplateConfiguration: Package::configuration.json
+              OutputArtifacts: [Name: ProdChangeSet]
+            - Name: Approval
+              RunOrder: 2
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                NotificationArn: !Ref BuildApprovalSNS
+                CustomData: !Sub "${SubDomainName} build awaiting approval to Production."
+            - Name: Deploy
+              RunOrder: 3
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: CloudFormation
+              InputArtifacts: [Name: ProdChangeSet]
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: ProdChangeSet
+                StackName: !Ref SubDomainName
+#  Webhook:
+#    Type: AWS::CodePipeline::Webhook
+#    Properties:
+#      AuthenticationConfiguration:
+#        SecretToken: !Ref AWS::AccountId
+#      Filters:
+#        - JsonPath: "$.ref"
+#          MatchEquals: refs/heads/{Branch}
+#      Authentication: GITHUB_HMAC
+#      TargetPipeline: !Ref Pipeline
+#      TargetAction: Source
+#      Name: javabuilder-webhook
+#      TargetPipelineVersion: !GetAtt Pipeline.Version
+#      RegisterWithThirdParty: true
+  Build:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/docker:17.09.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !ImportValue JavabuilderCodeBuildRole
+      Source:
+        Type: CODEPIPELINE
+        GitCloneDepth: 1
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              REF_NAME: ${GitHubBranch}
+              TEMPLATE_BUCKET: ${TemplateBucket}
+              OUTPUT_TEMPLATE: output.yml
+              SUB_DOMAIN: ${SubDomainName}
+              STAGING_SUB_DOMAIN: ${StagingSubDomainName}
+              TEMPLATE_CONFIG: configuration.json
+              STAGING_TEMPLATE_CONFIG: configuration-staging.json
+          phases:
+            install:
+              runtime-versions:
+                ruby: 2.7
+                java: corretto11
+              commands:
+                - apt-get update && apt-get install -y jq
+            build:
+              commands:
+                - /bin/bash ./package.sh
+          artifacts:
+            files:
+              - output.yml
+              - configuration.json
+              - configuration-staging.json
+  BuildApprovalSNS:
+    Type: AWS::SNS::Topic
+  ApprovalRequest:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./ciApproval
+      Handler: request.requestApproval
+      Role: !ImportValue JavabuilderLambdaExecutionRole
+      Environment:
+        Variables:
+          SLACK_CHANNEL: !Ref SlackApprovalChannel
+          SLACK_TOKEN: !Ref SlackToken
+          STACK_NAME: !Ref SubDomainName
+      Events:
+        ApprovalRequest:
+          Type: SNS
+          Properties:
+            Topic: !Ref BuildApprovalSNS
+  ApprovalRespond:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./ciApproval
+      Handler: response.respondApproval
+      Role: !ImportValue JavabuilderLambdaExecutionRole
+      Environment:
+        Variables:
+          SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+      Events:
+        ApprovalRespond:
+          Type: Api
+          Properties:
+            Path: /
+            Method: post
+  SlackPipelineEvent:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./ciApproval
+      Handler: stateChange.handler
+      Role: !ImportValue JavabuilderLambdaExecutionRole
+      Environment:
+        Variables:
+          SLACK_CHANNEL: !Ref SlackPipelineChannel
+          SLACK_TOKEN: !Ref SlackToken
+      Events:
+        Pipeline:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              detail-type:
+                - CodePipeline Stage Execution State Change
+              detail:
+                pipeline:
+                  - !Ref Pipeline
+Outputs:
+  ApprovalResponseUrl:
+    Description: "Approval Response URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
